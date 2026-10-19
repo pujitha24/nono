@@ -359,10 +359,21 @@ async fn read_http_response<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> 
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     loop {
-        let n = stream
-            .read(&mut tmp)
-            .await
-            .map_err(|e| ProxyError::OAuth2Exchange(format!("read response: {}", e)))?;
+        let n = match stream.read(&mut tmp).await {
+            Ok(n) => n,
+            // Many servers close without a TLS close_notify, which rustls
+            // reports as UnexpectedEof. Tolerate it only when the response is
+            // provably complete by its own framing, so truncation still errors.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    && response_framing_complete(&buf) =>
+            {
+                break;
+            }
+            Err(e) => {
+                return Err(ProxyError::OAuth2Exchange(format!("read response: {}", e)));
+            }
+        };
         if n == 0 {
             break;
         }
@@ -375,6 +386,72 @@ async fn read_http_response<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> 
         }
     }
     Ok(buf)
+}
+
+/// Return true if `buf` holds a full HTTP/1.x response delimited by
+/// `Content-Length` or chunked encoding. Responses delimited only by
+/// connection close cannot be verified and return false.
+fn response_framing_complete(buf: &[u8]) -> bool {
+    let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let body = &buf[head_end + 4..];
+    let Ok(head) = std::str::from_utf8(&buf[..head_end]) else {
+        return false;
+    };
+    let mut chunked = false;
+    let mut content_length: Option<usize> = None;
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            chunked = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            let parsed: Option<usize> = value.parse().ok();
+            // Conflicting duplicate Content-Length values are ambiguous.
+            if content_length.is_some_and(|prev| Some(prev) != parsed) {
+                return false;
+            }
+            content_length = parsed;
+        }
+    }
+    if chunked {
+        return chunked_body_complete(body);
+    }
+    content_length.is_some_and(|len| body.len() >= len)
+}
+
+/// Return true if `body` contains a chunked body through its terminating
+/// zero-size chunk and trailer section.
+fn chunked_body_complete(mut body: &[u8]) -> bool {
+    loop {
+        let Some(eol) = body.windows(2).position(|w| w == b"\r\n") else {
+            return false;
+        };
+        let Ok(size_line) = std::str::from_utf8(&body[..eol]) else {
+            return false;
+        };
+        let size_str = size_line.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_str, 16) else {
+            return false;
+        };
+        body = &body[eol + 2..];
+        if size == 0 {
+            // Trailer section ends with an empty line.
+            return body.starts_with(b"\r\n") || body.windows(4).any(|w| w == b"\r\n\r\n");
+        }
+        let Some(needed) = size.checked_add(2) else {
+            return false;
+        };
+        if body.len() < needed {
+            return false;
+        }
+        body = &body[needed..];
+    }
 }
 
 /// Parse the HTTP status code from the status line.
@@ -721,6 +798,70 @@ mod tests {
         r#"{"access_token":"fake-token","token_type":"Bearer","expires_in":3600}"#;
 
     // ── exchange_token response framing ──────────────────────────────────
+
+    /// Stream that yields `data`, then a rustls-style missing close_notify error.
+    struct NoCloseNotify {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl tokio::io::AsyncRead for NoCloseNotify {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed connection without sending TLS close_notify",
+                )));
+            }
+            let n = buf.remaining().min(self.data.len() - self.pos);
+            let start = self.pos;
+            buf.put_slice(&self.data[start..start + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn read_no_close_notify(resp: &str) -> Result<Vec<u8>> {
+        let mut s = NoCloseNotify {
+            data: resp.as_bytes().to_vec(),
+            pos: 0,
+        };
+        read_http_response(&mut s).await
+    }
+
+    #[tokio::test]
+    async fn test_read_response_tolerates_missing_close_notify_content_length() {
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            FAKE_TOKEN_JSON.len(),
+            FAKE_TOKEN_JSON
+        );
+        assert_eq!(read_no_close_notify(&resp).await.unwrap(), resp.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_read_response_tolerates_missing_close_notify_chunked() {
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            FAKE_TOKEN_JSON.len(),
+            FAKE_TOKEN_JSON
+        );
+        assert_eq!(read_no_close_notify(&resp).await.unwrap(), resp.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_read_response_rejects_truncated_without_close_notify() {
+        let short = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"access_token\"";
+        assert!(read_no_close_notify(short).await.is_err());
+        let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n{\"access";
+        assert!(read_no_close_notify(chunked).await.is_err());
+        let unframed = "HTTP/1.1 200 OK\r\n\r\n{}";
+        assert!(read_no_close_notify(unframed).await.is_err());
+    }
 
     #[tokio::test]
     async fn test_exchange_token_chunked_response() {
